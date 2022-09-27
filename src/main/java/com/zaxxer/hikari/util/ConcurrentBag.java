@@ -34,6 +34,7 @@ import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import com.zaxxer.hikari.pool.HikariPool;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -64,14 +65,26 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
    private static final Logger LOGGER = LoggerFactory.getLogger(ConcurrentBag.class);
    private static final ClockSource CLOCK = ClockSource.INSTANCE;
 
+   /**
+    * 缓存所有的数据库连接
+    */
    private final CopyOnWriteArrayList<T> sharedList;
    private final boolean weakThreadLocals;
 
+   /**
+    * 当前线程用的数据库连接
+    */
    private final ThreadLocal<List<Object>> threadList;
    private final IBagStateListener listener;
    private final AtomicInteger waiters;
    private volatile boolean closed;
 
+   /**
+    * 0 容量的快速传递队列
+    * 队列来源：
+    * requit 连接用完返回的连接
+    * add：添加的连接
+    */
    private final SynchronousQueue<T> handoffQueue;
 
    public interface IConcurrentBagEntry
@@ -129,6 +142,7 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
     */
    public T borrow(long timeout, final TimeUnit timeUnit) throws InterruptedException
    {
+      //首先从当前线程用过的连接中获取
       // Try the thread-local list first
       List<Object> list = threadList.get();
       if (weakThreadLocals && list == null) {
@@ -145,6 +159,7 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
          }
       }
 
+      //如果没有就从公共总线程池里面拿
       // Otherwise, scan the shared list ... then poll the handoff queue
       final int waiting = waiters.incrementAndGet();
       try {
@@ -152,6 +167,9 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
             if (bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
                // If we may have stolen another waiter's connection, request another bag add.
                if (waiting > 1) {
+                  /**
+                   * @see HikariPool#addBagItem(int)
+                   */
                   listener.addBagItem(waiting - 1);
                }
                return bagEntry;
@@ -163,14 +181,17 @@ public class ConcurrentBag<T extends IConcurrentBagEntry> implements AutoCloseab
          timeout = timeUnit.toNanos(timeout);
          do {
             final long start = CLOCK.currentTime();
+            //从队列内获取  队列来源：requit add
             final T bagEntry = handoffQueue.poll(timeout, NANOSECONDS);
+            //如果（bagEntry为空）则返回空
+            //如果不为空并且状态转换成功则直接返回获取到的连接
             if (bagEntry == null || bagEntry.compareAndSet(STATE_NOT_IN_USE, STATE_IN_USE)) {
                return bagEntry;
             }
 
             timeout -= CLOCK.elapsedNanos(start);
-         } while (timeout > 10_000);
-
+         } while (timeout > 1_0000);
+         //如果超时 则直接返回空
          return null;
       }
       finally {
